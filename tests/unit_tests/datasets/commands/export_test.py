@@ -379,6 +379,56 @@ def test_export_database_bundle_includes_child_uuids(session: Session) -> None:
     assert [column["uuid"] for column in payload["columns"]] == [str(column_uuid)]
 
 
+def test_export_database_with_same_named_datasets(session: Session) -> None:
+    """
+    A database export must include same-named datasets at distinct paths.
+
+    Related datasets are serialized through ``ExportDatasetsCommand``, so their
+    filenames are disambiguated by dataset id and their JSON-backed fields are
+    normalized to dictionaries, as the import schema expects.
+    """
+    from superset.commands.database.export import ExportDatabasesCommand
+    from superset.connectors.sqla.models import SqlaTable
+    from superset.models.core import Database
+
+    engine = db.session.get_bind()
+    SqlaTable.metadata.create_all(engine)  # pylint: disable=no-member
+
+    database = Database(database_name="my_database", sqlalchemy_uri="sqlite://")
+    db.session.add(database)
+    db.session.flush()
+
+    prod = SqlaTable(
+        table_name="users",
+        schema="prod",
+        database=database,
+        params=json.dumps({"remote_id": 64}),
+        template_params=json.dumps({"answer": "42"}),
+        extra=json.dumps({"warning_markdown": "*WARNING*"}),
+    )
+    dev = SqlaTable(table_name="users", schema="dev", database=database)
+    db.session.add_all([prod, dev])
+    db.session.flush()
+
+    contents = {
+        path: content_fn()
+        for path, content_fn in ExportDatabasesCommand._export(database)  # pylint: disable=protected-access
+    }
+
+    assert sorted(path for path in contents if path.startswith("datasets/")) == sorted(
+        [
+            f"datasets/my_database/users_{prod.id}.yaml",
+            f"datasets/my_database/users_{dev.id}.yaml",
+        ]
+    )
+
+    payload = yaml.safe_load(contents[f"datasets/my_database/users_{prod.id}.yaml"])
+    assert payload["params"] == {"remote_id": 64}
+    assert payload["template_params"] == {"answer": "42"}
+    assert payload["extra"] == {"warning_markdown": "*WARNING*"}
+    assert payload["database_uuid"] == str(database.uuid)
+
+
 def test_export_two_datasets_same_table_name_different_schema(
     session: Session,
 ) -> None:
