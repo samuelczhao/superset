@@ -14,15 +14,70 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-import contextlib
 from typing import Any
 
-from sqlalchemy import MetaData
+from sqlalchemy import case, cast, MetaData, String
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.sql import and_, func, join, literal, select
+from sqlalchemy.sql import and_, ColumnElement, func, join, literal, select
 
 from superset.extensions import db
 from superset.tags.models import ObjectType, TagType
+from superset.utils.decorators import transaction
+
+
+def tag_name(prefix: str, column: ColumnElement[Any]) -> ColumnElement[str]:
+    """
+    Build an implicit tag name such as ``editor:1`` from a column.
+
+    The column is cast to a string so that the expression compiles to a
+    concatenation (``||`` or ``CONCAT``) on every supported dialect rather than
+    to a numeric addition.
+    """
+
+    return literal(prefix) + cast(column, String)
+
+
+def create_tags(
+    tag: Any,
+    names: set[str],
+    type_: TagType,
+    repair_from: tuple[TagType, ...] = (),
+) -> None:
+    """
+    Create the implicit tags that don't exist yet.
+
+    Tag names are unique, so existing tags stored with one of the ``repair_from``
+    types are updated in place instead of being inserted again. Each insert runs
+    in a savepoint so that a concurrently created tag doesn't abort the
+    surrounding transaction.
+    """
+
+    if not names:
+        return
+
+    existing = dict(
+        db.session.execute(
+            select(tag.c.name, tag.c.type).where(tag.c.name.in_(names))
+        ).all()
+    )
+
+    if repair_from and (
+        mistyped := sorted(
+            name
+            for name, existing_type in existing.items()
+            if existing_type in repair_from
+        )
+    ):
+        db.session.execute(
+            tag.update().where(tag.c.name.in_(mistyped)).values(type=type_)
+        )
+
+    for name in sorted(names - existing.keys()):
+        try:
+            with db.session.begin_nested():
+                db.session.execute(tag.insert().values(name=name, type=type_))
+        except IntegrityError:  # already exists
+            pass
 
 
 def add_types_to_charts(
@@ -145,6 +200,7 @@ def add_types_to_datasets(
     db.session.execute(query)
 
 
+@transaction()
 def add_types(metadata: MetaData) -> None:
     """
     Tag every object according to its type:
@@ -212,10 +268,9 @@ def add_types(metadata: MetaData) -> None:
     columns = ["tag_id", "object_id", "object_type"]
 
     # add a tag for each object type
-    insert = tag.insert()
-    for type_ in ObjectType.__members__:
-        with contextlib.suppress(IntegrityError):  # already exists
-            db.session.execute(insert, name=f"type:{type_}", type=TagType.type)
+    create_tags(
+        tag, {f"type:{type_}" for type_ in ObjectType.__members__}, TagType.type
+    )
 
     add_types_to_charts(metadata, tag, tagged_object, columns)
     add_types_to_dashboards(metadata, tag, tagged_object, columns)
@@ -239,7 +294,7 @@ def add_owners_to_charts(
                 join(
                     slices,
                     tag,
-                    tag.c.name == "editor:" + slices.c.created_by_fk,
+                    tag.c.name == tag_name("editor:", slices.c.created_by_fk),
                 ),
                 tagged_object,
                 and_(
@@ -273,7 +328,7 @@ def add_owners_to_dashboards(
                 join(
                     dashboard_table,
                     tag,
-                    tag.c.name == "editor:" + dashboard_table.c.created_by_fk,
+                    tag.c.name == tag_name("editor:", dashboard_table.c.created_by_fk),
                 ),
                 tagged_object,
                 and_(
@@ -307,7 +362,7 @@ def add_owners_to_saved_queries(
                 join(
                     saved_query,
                     tag,
-                    tag.c.name == "editor:" + saved_query.c.created_by_fk,
+                    tag.c.name == tag_name("editor:", saved_query.c.created_by_fk),
                 ),
                 tagged_object,
                 and_(
@@ -341,7 +396,7 @@ def add_owners_to_datasets(
                 join(
                     tables,
                     tag,
-                    tag.c.name == "editor:" + tables.c.created_by_fk,
+                    tag.c.name == tag_name("editor:", tables.c.created_by_fk),
                 ),
                 tagged_object,
                 and_(
@@ -359,6 +414,7 @@ def add_owners_to_datasets(
     db.session.execute(query)
 
 
+@transaction()
 def add_owners(metadata: MetaData) -> None:
     """
     Tag every object according to its editor:
@@ -423,18 +479,18 @@ def add_owners(metadata: MetaData) -> None:
     users = metadata.tables["ab_user"]
     columns = ["tag_id", "object_id", "object_type"]
 
-    # create a custom tag for each user
+    # create an implicit tag for each user
     ids = select(users.c.id)
-    insert = tag.insert()
-    for (id_,) in db.session.execute(ids):
-        with contextlib.suppress(IntegrityError):  # already exists
-            db.session.execute(insert, name=f"editor:{id_}", type=TagType.editor)
+    names = {f"editor:{id_}" for (id_,) in db.session.execute(ids)}
+    create_tags(tag, names, TagType.editor)
+
     add_owners_to_charts(metadata, tag, tagged_object, columns)
     add_owners_to_dashboards(metadata, tag, tagged_object, columns)
     add_owners_to_saved_queries(metadata, tag, tagged_object, columns)
     add_owners_to_datasets(metadata, tag, tagged_object, columns)
 
 
+@transaction()
 def add_favorites(metadata: MetaData) -> None:
     """
     Tag every object that was favorited:
@@ -443,14 +499,20 @@ def add_favorites(metadata: MetaData) -> None:
       SELECT
         tag.id AS tag_id,
         favstar.obj_id AS object_id,
-        LOWER(favstar.class_name) AS object_type
+        CASE
+          WHEN LOWER(favstar.class_name) = 'slice' THEN 'chart'
+          ELSE LOWER(favstar.class_name)
+        END AS object_type
       FROM favstar
       JOIN tag
       ON tag.name = CONCAT('favorited_by:', favstar.user_id)
       LEFT OUTER JOIN tagged_object
         ON tagged_object.tag_id = tag.id
         AND tagged_object.object_id = favstar.obj_id
-        AND tagged_object.object_type = LOWER(favstar.class_name)
+        AND tagged_object.object_type = CASE
+          WHEN LOWER(favstar.class_name) = 'slice' THEN 'chart'
+          ELSE LOWER(favstar.class_name)
+        END
       WHERE tagged_object.tag_id IS NULL;
 
     """
@@ -461,30 +523,38 @@ def add_favorites(metadata: MetaData) -> None:
     favstar = metadata.tables["favstar"]
     columns = ["tag_id", "object_id", "object_type"]
 
-    # create a custom tag for each user
+    # create an implicit tag for each user, repairing tags that a previous
+    # backfill misclassified as ``TagType.type``
     ids = select(users.c.id)
-    insert = tag.insert()
-    for (id_,) in db.session.execute(ids):
-        with contextlib.suppress(IntegrityError):  # already exists
-            db.session.execute(insert, name=f"favorited_by:{id_}", type=TagType.type)
+    names = {f"favorited_by:{id_}" for (id_,) in db.session.execute(ids)}
+    create_tags(tag, names, TagType.favorited_by, repair_from=(TagType.type,))
+
+    # ``favstar.class_name`` holds the model name, which for charts ("slice")
+    # differs from the object type stored on ``tagged_object``
+    class_name = func.lower(favstar.c.class_name)
+    object_type = case(
+        (class_name == "slice", literal(ObjectType.chart.name)),
+        else_=class_name,
+    )
+
     favstars = (
         select(
             tag.c.id.label("tag_id"),
             favstar.c.obj_id.label("object_id"),
-            func.lower(favstar.c.class_name).label("object_type"),
+            object_type.label("object_type"),
         )
         .select_from(
             join(
                 join(
                     favstar,
                     tag,
-                    tag.c.name == "favorited_by:" + favstar.c.user_id,
+                    tag.c.name == tag_name("favorited_by:", favstar.c.user_id),
                 ),
                 tagged_object,
                 and_(
                     tagged_object.c.tag_id == tag.c.id,
                     tagged_object.c.object_id == favstar.c.obj_id,
-                    tagged_object.c.object_type == func.lower(favstar.c.class_name),
+                    tagged_object.c.object_type == object_type,
                 ),
                 isouter=True,
                 full=False,
