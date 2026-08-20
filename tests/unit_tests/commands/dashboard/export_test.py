@@ -164,6 +164,90 @@ def test_export_yields_dataset_files_for_display_controls():
     assert "datasets/my_dataset.yaml" in filenames
 
 
+def test_dashboard_export_aborting_nested_chart_export_does_not_leak_tag_state():
+    from superset.commands.chart.export import ExportChartsCommand
+    from superset.commands.dashboard.export import ExportDashboardsCommand
+
+    chart = MagicMock()
+    chart.id = 1
+    chart.slice_name = "Test Chart"
+    chart.table = None
+    mock_dashboard = _make_mock_dashboard({"native_filter_configuration": []})
+    mock_dashboard.id = 10
+    mock_dashboard.slices = [chart]
+
+    export_tags = MagicMock()
+    export_tags.run.return_value = iter([("tags.yaml", lambda: "")])
+
+    with (
+        patch(
+            "superset.commands.dashboard.export.ExportChartsCommand",
+            wraps=ExportChartsCommand,
+        ) as export_charts_cls,
+        patch(
+            "superset.commands.chart.export.ChartDAO.find_by_ids",
+            return_value=[chart],
+        ),
+        patch(
+            "superset.commands.chart.export.ExportTagsCommand",
+            return_value=export_tags,
+        ),
+        patch(
+            "superset.extensions.feature_flag_manager.is_feature_enabled",
+            return_value=True,
+        ),
+    ):
+        dashboard_export = ExportDashboardsCommand._export(mock_dashboard)
+        next(dashboard_export)
+        next(dashboard_export)
+        dashboard_export.close()
+
+        files = [file_name for file_name, _ in ExportChartsCommand([chart.id]).run()]
+
+    export_charts_cls.assert_called_once_with([chart.id], include_tags=False)
+    assert "tags.yaml" in files
+
+
+def test_dashboard_export_emits_one_combined_tag_file():
+    from superset.commands.chart.export import ExportChartsCommand
+    from superset.commands.dashboard.export import ExportDashboardsCommand
+
+    chart = MagicMock()
+    chart.id = 1
+    chart.slice_name = "Test Chart"
+    chart.table = None
+    mock_dashboard = _make_mock_dashboard({"native_filter_configuration": []})
+    mock_dashboard.id = 10
+    mock_dashboard.slices = [chart]
+
+    export_tags = MagicMock()
+    export_tags.run.return_value = iter([("tags.yaml", lambda: "")])
+
+    with (
+        patch(
+            "superset.commands.dashboard.export.ExportChartsCommand",
+            wraps=ExportChartsCommand,
+        ) as export_charts_cls,
+        patch(
+            "superset.commands.dashboard.export.ExportTagsCommand",
+            return_value=export_tags,
+        ),
+        patch(
+            "superset.commands.chart.export.ChartDAO.find_by_ids",
+            return_value=[chart],
+        ),
+        patch(
+            "superset.extensions.feature_flag_manager.is_feature_enabled",
+            return_value=True,
+        ),
+    ):
+        results = list(ExportDashboardsCommand._export(mock_dashboard))
+
+    export_charts_cls.assert_called_once_with([chart.id], include_tags=False)
+    filenames = [name for name, _ in results]
+    assert filenames.count("tags.yaml") == 1
+
+
 def test_file_content_null_chart_customization_config_does_not_raise():
     """
     When chart_customization_config is explicitly null in metadata,

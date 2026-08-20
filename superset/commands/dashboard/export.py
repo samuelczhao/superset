@@ -393,10 +393,9 @@ class ExportDashboardsCommand(ExportModelsCommand):
         if export_related:
             chart_ids = [chart.id for chart in model.slices]
             dashboard_ids = model.id
-            command = ExportChartsCommand(chart_ids)
-            command.disable_tag_export()
-            yield from command.run()
-            command.enable_tag_export()
+            # tags for the nested charts are emitted below as part of a single
+            # combined tag file, so the chart command must not emit its own
+            yield from ExportChartsCommand(chart_ids, include_tags=False).run()
             if feature_flag_manager.is_feature_enabled("TAGGING_SYSTEM"):
                 yield from ExportTagsCommand(
                     dashboard_ids=dashboard_ids, chart_ids=chart_ids
