@@ -55,7 +55,6 @@ def set_database_uri(database_name: str, uri: str, skip_create: bool) -> None:
 
 @click.command()
 @with_appcontext
-@transaction()
 def sync_tags() -> None:
     """Rebuilds special tags (owner, type, favorited by)."""
     # pylint: disable=no-member
@@ -64,6 +63,9 @@ def sync_tags() -> None:
     # pylint: disable=import-outside-toplevel
     from superset.common.tags import add_favorites, add_owners, add_types
 
+    # each backfill is its own unit of work (see the ``transaction`` decorator on
+    # them), so a failure in a later one doesn't discard the tags and
+    # associations written by the earlier ones
     add_types(metadata)
     add_owners(metadata)
     add_favorites(metadata)
