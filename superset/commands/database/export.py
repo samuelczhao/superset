@@ -23,6 +23,7 @@ from collections.abc import Iterator
 import yaml
 
 from superset.commands.database.exceptions import DatabaseNotFoundError
+from superset.commands.dataset.export import ExportDatasetsCommand
 from superset.daos.database import DatabaseDAO
 from superset.commands.export.models import ExportModelsCommand
 from superset.models.core import Database
@@ -121,28 +122,8 @@ class ExportDatabasesCommand(ExportModelsCommand):
         )
 
         if export_related:
-            db_file_name = get_filename(model.database_name, model.id, skip_id=True)
             for dataset in model.tables:
-                ds_file_name = get_filename(
-                    dataset.table_name, dataset.id, skip_id=True
-                )
-                file_path = f"datasets/{db_file_name}/{ds_file_name}.yaml"
-
-                payload = dataset.export_to_dict(
-                    recursive=True,
-                    include_parent_ref=False,
-                    include_defaults=True,
-                    export_uuids=True,
-                )
-                payload["version"] = EXPORT_VERSION
-                payload["database_uuid"] = str(model.uuid)
-
                 yield (
-                    file_path,
-                    functools.partial(  # type: ignore
-                        yaml.safe_dump,
-                        payload,
-                        sort_keys=False,
-                        allow_unicode=True,
-                    ),
+                    ExportDatasetsCommand._file_name(dataset),
+                    functools.partial(ExportDatasetsCommand._file_content, dataset),
                 )
