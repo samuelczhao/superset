@@ -22,7 +22,13 @@ from sqlalchemy.dialects import mysql, postgresql, sqlite
 from sqlalchemy.engine.interfaces import Dialect
 from sqlalchemy.orm.session import Session
 
-from superset.common.tags import add_favorites, add_owners, add_types, tag_name
+from superset.common.tags import (
+    add_favorites,
+    add_owners,
+    add_types,
+    ReservedTagNameError,
+    tag_name,
+)
 from superset.tags.models import ObjectType, Tag, TaggedObject, TagType
 
 
@@ -189,6 +195,112 @@ def test_add_favorites_repairs_misclassified_tag(session: Session) -> None:
     # unrelated tags are untouched
     assert _tags(session, "type:chart")[0].type == TagType.type
     assert _tags(session, "my tag")[0].type == TagType.custom
+
+
+def test_add_owners_rejects_reserved_name_collision(session: Session) -> None:
+    """
+    A custom tag holding a reserved editor name is a collision, not a tag to reuse.
+    """
+
+    from flask_appbuilder import Model
+
+    _setup(session)
+    session.add(Tag(name="editor:1", type=TagType.custom))
+    session.add(Tag(name="my tag", type=TagType.custom))
+    session.commit()
+
+    with pytest.raises(ReservedTagNameError) as excinfo:
+        add_owners(Model.metadata)  # pylint: disable=no-member
+
+    assert "editor:1" in str(excinfo.value)
+
+    # the unrelated tag keeps its type and gains no implicit associations
+    tags = _tags(session, "editor:1")
+    assert len(tags) == 1
+    assert tags[0].type == TagType.custom
+    assert _associations(session, "editor:1") == set()
+    assert _tags(session, "my tag")[0].type == TagType.custom
+    assert session.query(TaggedObject).count() == 0
+
+
+def test_add_favorites_rejects_reserved_name_collision(session: Session) -> None:
+    """
+    A tag of an unrepairable type holding a reserved favorite name is a collision.
+    """
+
+    from flask_appbuilder import Model
+
+    _setup(session)
+    session.add(Tag(name="favorited_by:1", type=TagType.editor))
+    session.commit()
+
+    with pytest.raises(ReservedTagNameError) as excinfo:
+        add_favorites(Model.metadata)  # pylint: disable=no-member
+
+    assert "favorited_by:1" in str(excinfo.value)
+
+    tags = _tags(session, "favorited_by:1")
+    assert len(tags) == 1
+    assert tags[0].type == TagType.editor
+    assert _associations(session, "favorited_by:1") == set()
+    assert session.query(TaggedObject).count() == 0
+
+
+def test_concurrent_insert_repairs_misclassified_tag(
+    session: Session, mocker: MockerFixture
+) -> None:
+    """
+    Losing the insert race to a misclassified tag repairs the row that won.
+
+    The first read is mocked empty so that the insert hits the unique name and
+    raises, which is what a tag created between the read and the insert does.
+    """
+
+    from flask_appbuilder import Model
+
+    _setup(session)
+    session.add(Tag(name="favorited_by:1", type=TagType.type))
+    session.commit()
+    mocker.patch(
+        "superset.common.tags.existing_tags",
+        side_effect=[{}, {"favorited_by:1": TagType.type}],
+    )
+
+    add_favorites(Model.metadata)  # pylint: disable=no-member
+
+    tags = _tags(session, "favorited_by:1")
+    assert len(tags) == 1
+    assert tags[0].type == TagType.favorited_by
+    assert _associations(session, "favorited_by:1") == {(ObjectType.chart, 10)}
+
+
+def test_concurrent_insert_rejects_reserved_name_collision(
+    session: Session, mocker: MockerFixture
+) -> None:
+    """
+    Losing the insert race to a custom tag raises instead of reusing it.
+    """
+
+    from flask_appbuilder import Model
+
+    _setup(session)
+    session.add(Tag(name="editor:1", type=TagType.custom))
+    session.commit()
+    mocker.patch(
+        "superset.common.tags.existing_tags",
+        side_effect=[{}, {"editor:1": TagType.custom}],
+    )
+
+    with pytest.raises(ReservedTagNameError) as excinfo:
+        add_owners(Model.metadata)  # pylint: disable=no-member
+
+    assert "editor:1" in str(excinfo.value)
+
+    tags = _tags(session, "editor:1")
+    assert len(tags) == 1
+    assert tags[0].type == TagType.custom
+    assert _associations(session, "editor:1") == set()
+    assert session.query(TaggedObject).count() == 0
 
 
 def test_backfills_commit_independently(

@@ -20,9 +20,16 @@ from sqlalchemy import case, cast, MetaData, String
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.sql import and_, ColumnElement, func, join, literal, select
 
+from superset.exceptions import SupersetException
 from superset.extensions import db
 from superset.tags.models import ObjectType, TagType
 from superset.utils.decorators import transaction
+
+
+class ReservedTagNameError(SupersetException):  # noqa: N818
+    """
+    An implicit tag name is already taken by a tag of an unexpected type.
+    """
 
 
 def tag_name(prefix: str, column: ColumnElement[Any]) -> ColumnElement[str]:
@@ -37,6 +44,52 @@ def tag_name(prefix: str, column: ColumnElement[Any]) -> ColumnElement[str]:
     return literal(prefix) + cast(column, String)
 
 
+def existing_tags(tag: Any, names: set[str]) -> dict[str, TagType]:
+    """
+    Read the type of the tags that already hold one of ``names``.
+    """
+
+    return dict(
+        db.session.execute(
+            select(tag.c.name, tag.c.type).where(tag.c.name.in_(names))
+        ).all()
+    )
+
+
+def reconcile_tags(
+    tag: Any,
+    existing: dict[str, TagType],
+    type_: TagType,
+    repair_from: tuple[TagType, ...],
+) -> None:
+    """
+    Bring existing tags holding a reserved name to ``type_``, or refuse to.
+
+    Only the types listed in ``repair_from`` are repaired, since those are the
+    ones a previous backfill misclassified. Any other type is an explicit
+    collision: reusing the tag would attach implicit associations to a tag the
+    application doesn't manage as implicit, and mutating it would destroy user
+    data.
+    """
+
+    if colliding := sorted(
+        f"{name} ({existing_type})"
+        for name, existing_type in existing.items()
+        if existing_type != type_ and existing_type not in repair_from
+    ):
+        raise ReservedTagNameError(
+            f"Tags with a reserved name exist with an unexpected type, expected "
+            f"{type_}: {', '.join(colliding)}. Rename or remove them and re-run."
+        )
+
+    if mistyped := sorted(
+        name for name, existing_type in existing.items() if existing_type != type_
+    ):
+        db.session.execute(
+            tag.update().where(tag.c.name.in_(mistyped)).values(type=type_)
+        )
+
+
 def create_tags(
     tag: Any,
     names: set[str],
@@ -46,38 +99,29 @@ def create_tags(
     """
     Create the implicit tags that don't exist yet.
 
-    Tag names are unique, so existing tags stored with one of the ``repair_from``
-    types are updated in place instead of being inserted again. Each insert runs
-    in a savepoint so that a concurrently created tag doesn't abort the
-    surrounding transaction.
+    Tag names are unique, so an existing tag is reconciled in place (see
+    :func:`reconcile_tags`) instead of being inserted again. Each insert runs in
+    a savepoint so that a tag created concurrently doesn't abort the surrounding
+    transaction; the loser of such a race reconciles the row that won instead of
+    ignoring it, so a concurrent tag of an unexpected type still raises.
+
+    Associations, unlike tag rows, are not protected against concurrent writes:
+    this is an administrative command, and objects created or favorited while it
+    runs are picked up by the next run.
     """
 
     if not names:
         return
 
-    existing = dict(
-        db.session.execute(
-            select(tag.c.name, tag.c.type).where(tag.c.name.in_(names))
-        ).all()
-    )
-
-    if repair_from and (
-        mistyped := sorted(
-            name
-            for name, existing_type in existing.items()
-            if existing_type in repair_from
-        )
-    ):
-        db.session.execute(
-            tag.update().where(tag.c.name.in_(mistyped)).values(type=type_)
-        )
+    existing = existing_tags(tag, names)
+    reconcile_tags(tag, existing, type_, repair_from)
 
     for name in sorted(names - existing.keys()):
         try:
             with db.session.begin_nested():
                 db.session.execute(tag.insert().values(name=name, type=type_))
-        except IntegrityError:  # already exists
-            pass
+        except IntegrityError:  # created concurrently
+            reconcile_tags(tag, existing_tags(tag, {name}), type_, repair_from)
 
 
 def add_types_to_charts(
@@ -294,7 +338,10 @@ def add_owners_to_charts(
                 join(
                     slices,
                     tag,
-                    tag.c.name == tag_name("editor:", slices.c.created_by_fk),
+                    and_(
+                        tag.c.type == TagType.editor,
+                        tag.c.name == tag_name("editor:", slices.c.created_by_fk),
+                    ),
                 ),
                 tagged_object,
                 and_(
@@ -328,7 +375,11 @@ def add_owners_to_dashboards(
                 join(
                     dashboard_table,
                     tag,
-                    tag.c.name == tag_name("editor:", dashboard_table.c.created_by_fk),
+                    and_(
+                        tag.c.type == TagType.editor,
+                        tag.c.name
+                        == tag_name("editor:", dashboard_table.c.created_by_fk),
+                    ),
                 ),
                 tagged_object,
                 and_(
@@ -362,7 +413,10 @@ def add_owners_to_saved_queries(
                 join(
                     saved_query,
                     tag,
-                    tag.c.name == tag_name("editor:", saved_query.c.created_by_fk),
+                    and_(
+                        tag.c.type == TagType.editor,
+                        tag.c.name == tag_name("editor:", saved_query.c.created_by_fk),
+                    ),
                 ),
                 tagged_object,
                 and_(
@@ -396,7 +450,10 @@ def add_owners_to_datasets(
                 join(
                     tables,
                     tag,
-                    tag.c.name == tag_name("editor:", tables.c.created_by_fk),
+                    and_(
+                        tag.c.type == TagType.editor,
+                        tag.c.name == tag_name("editor:", tables.c.created_by_fk),
+                    ),
                 ),
                 tagged_object,
                 and_(
@@ -548,7 +605,10 @@ def add_favorites(metadata: MetaData) -> None:
                 join(
                     favstar,
                     tag,
-                    tag.c.name == tag_name("favorited_by:", favstar.c.user_id),
+                    and_(
+                        tag.c.type == TagType.favorited_by,
+                        tag.c.name == tag_name("favorited_by:", favstar.c.user_id),
+                    ),
                 ),
                 tagged_object,
                 and_(
