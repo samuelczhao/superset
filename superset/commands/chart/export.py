@@ -45,6 +45,20 @@ class ExportChartsCommand(ExportModelsCommand):
     dao = ChartDAO
     not_found = ChartNotFoundError
 
+    def __init__(
+        self,
+        model_ids: list[int],
+        export_related: bool = True,
+        include_tags: bool = True,
+    ):
+        """
+        :param include_tags: whether this command emits its own `tags.yaml`. A
+            parent command that emits a combined tag file (e.g. a dashboard
+            export) passes `False` to suppress it for this instance only.
+        """
+        super().__init__(model_ids, export_related)
+        self.include_tags = include_tags
+
     @staticmethod
     def _file_name(model: Slice) -> str:
         file_name = get_filename(model.slice_name, model.id)
@@ -81,16 +95,6 @@ class ExportChartsCommand(ExportModelsCommand):
         file_content = yaml.safe_dump(payload, sort_keys=False, allow_unicode=True)
         return file_content
 
-    _include_tags: bool = True  # Default to True
-
-    @classmethod
-    def disable_tag_export(cls) -> None:
-        cls._include_tags = False
-
-    @classmethod
-    def enable_tag_export(cls) -> None:
-        cls._include_tags = True
-
     def run(self) -> Iterator[tuple[str, Callable[[], str]]]:
         yield from super().run()
 
@@ -99,7 +103,7 @@ class ExportChartsCommand(ExportModelsCommand):
         # the parent's per-file-name de-duplication of `tags.yaml`.
         if (
             self.export_related
-            and ExportChartsCommand._include_tags
+            and self.include_tags
             and feature_flag_manager.is_feature_enabled("TAGGING_SYSTEM")
         ):
             yield from ExportTagsCommand(
