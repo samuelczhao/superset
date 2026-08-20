@@ -461,12 +461,33 @@ def add_favorites(metadata: MetaData) -> None:
     favstar = metadata.tables["favstar"]
     columns = ["tag_id", "object_id", "object_type"]
 
-    # create a custom tag for each user
+    # create an implicit tag for each user
     ids = select(users.c.id)
-    insert = tag.insert()
-    for (id_,) in db.session.execute(ids):
+    names = {f"favorited_by:{id_}" for (id_,) in db.session.execute(ids)}
+
+    existing = dict(
+        db.session.execute(
+            select(tag.c.name, tag.c.type).where(tag.c.name.in_(names))
+        ).all()
+    )
+
+    # tag names are unique, so tags backfilled with the wrong type are repaired
+    # instead of inserted again
+    if mistyped := [
+        name for name, type_ in existing.items() if type_ != TagType.favorited_by
+    ]:
+        db.session.execute(
+            tag.update()
+            .where(tag.c.name.in_(mistyped))
+            .values(type=TagType.favorited_by)
+        )
+
+    for name in sorted(names - existing.keys()):
         with contextlib.suppress(IntegrityError):  # already exists
-            db.session.execute(insert, name=f"favorited_by:{id_}", type=TagType.type)
+            db.session.execute(
+                tag.insert().values(name=name, type=TagType.favorited_by)
+            )
+
     favstars = (
         select(
             tag.c.id.label("tag_id"),
