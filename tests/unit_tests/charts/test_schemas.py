@@ -20,6 +20,7 @@ from flask import current_app
 from marshmallow import ValidationError
 
 from superset.charts.schemas import (
+    ChartDataAdhocMetricSchema,
     ChartDataExtrasSchema,
     ChartDataProphetOptionsSchema,
     ChartDataQueryObjectSchema,
@@ -478,3 +479,23 @@ def test_chart_data_extras_rejects_system_sampling(app_context: None) -> None:
     with pytest.raises(ValidationError) as exc_info:
         ChartDataExtrasSchema().load({"system_sampling": True})
     assert "system_sampling" in exc_info.value.messages
+
+
+@pytest.mark.parametrize("aggregate", ["MEDIAN", "STDDEV_SAMP", "VAR_SAMP"])
+def test_chart_data_adhoc_metric_schema_accepts_extended_aggregates(
+    app_context: None, aggregate: str
+) -> None:
+    """
+    The chart-data REST schema's ``aggregate`` enum must stay in sync with
+    ``EXTENDED_METRIC_AGGREGATES``, otherwise Swagger/generated clients
+    reject requests using these compiler-supported aggregates.
+    """
+    schema = ChartDataAdhocMetricSchema()
+    result = schema.load(
+        {
+            "expressionType": "SIMPLE",
+            "aggregate": aggregate,
+            "column": {"column_name": "value"},
+        }
+    )
+    assert result["aggregate"] == aggregate
